@@ -104,6 +104,30 @@ class PolicyCopy(Plugin):
         source = self.config["source_room"]
         destination = self.config["destination_room"]
 
+        # 0. Refuse to mirror anything that isn't a real state event.
+        #    Anyone with events_default power (usually 0) can send a plain
+        #    *message* event whose type merely claims to be m.policy.rule.*.
+        #    Such an event has no state_key at all — that's the defining
+        #    difference from a state event. Today mautrix already fails to
+        #    deserialize those into StateEvent (missing state_key) and never
+        #    dispatches them here, but that's a library implementation detail,
+        #    not a guarantee. Without this check, a change in that behavior
+        #    would let an unprivileged user in the source room get their fake
+        #    rule re-issued by us as genuine state in the destination room —
+        #    a straight privilege escalation to "can ban things on the list".
+        #
+        #    NB: must be `is None`, NOT falsiness. state_key="" is a valid
+        #    (and for many event types, the normal) value; only a *missing*
+        #    key means "not state". Policy rules always use non-empty keys in
+        #    practice, but we don't encode that assumption.
+        if getattr(evt, "state_key", None) is None:
+            self.log.warning(
+                "Refusing to mirror non-state event %s (type=%s, sender=%s): "
+                "no state_key — likely a spoofed message event",
+                getattr(evt, "event_id", "<unknown>"), evt.type, evt.sender,
+            )
+            return
+
         # 1. Ignore events from rooms other than the configured source.
         #    The bot may sit in many rooms — we only mirror from one.
         if evt.room_id != source:
