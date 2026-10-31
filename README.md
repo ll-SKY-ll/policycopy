@@ -9,6 +9,7 @@ Watches a single **source room** for policy rule state events and forwards each 
 - `m.policy.rule.user`
 - `m.policy.rule.room`
 - `m.policy.rule.server`
+
 Retractions (empty content `{}` for an existing `state_key`) are forwarded the same way as additions.
  
 ## Requirements
