@@ -1,0 +1,77 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+    branches:
+      - dev
+      - main
+
+jobs:
+  test:
+    runs-on: [debian-host]
+    env:
+      TEST_POSTGRES_DSN: ${{ secrets.CT_150_POSTGRES }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bootstrap uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run tests across Python versions (sequential)
+        run: |
+          set -u
+          echo "TEST_POSTGRES_DSN length: ${#TEST_POSTGRES_DSN}"
+          if [ -z "$TEST_POSTGRES_DSN" ]; then
+            echo "TEST_POSTGRES_DSN is empty -- postgres tests would skip. Failing."
+            exit 1
+          fi
+
+          versions="3.10 3.11 3.12 3.13 3.14"
+          failed=""
+
+          for v in $versions; do
+            echo "::group::Python $v"
+            echo "===== Python $v ====="
+            if uv python install "$v" \
+              && uv venv --python "$v" ".venv-$v" \
+              && uv pip install --python ".venv-$v/bin/python" -r requirements-dev.txt \
+              && ".venv-$v/bin/python" -m pytest -v; then
+              echo "Python $v: PASS"
+            else
+              echo "Python $v: FAIL"
+              failed="$failed $v"
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "=================================================="
+          if [ -n "$failed" ]; then
+            echo "FAILED on Python version(s):$failed"
+            exit 1
+          fi
+          echo "All Python versions passed."
+
+  typecheck:
+    runs-on: [debian-host]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up virtualenv and install deps
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run mypy
+        run: |
+          . .venv/bin/activate
+          mypy policycopy.py

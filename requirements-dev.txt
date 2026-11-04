@@ -1,0 +1,7 @@
+maubot
+asyncpg
+aiosqlite
+pytest
+pytest-asyncio
+ruff
+mypy

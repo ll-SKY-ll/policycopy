@@ -36,14 +36,16 @@ The bot user must:
 
 from __future__ import annotations
 
-from typing import Type
+import asyncio
+import json
+from typing import Any
 
-from mautrix.types import EventType, StateEvent
-from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
-
-from maubot import Plugin
+from maubot import Plugin  # type: ignore[attr-defined]
 from maubot.handlers import event
-
+from mautrix.client import InternalEventType
+from mautrix.types import JSON, EventType, FilterID, StateEvent, SyncToken
+from mautrix.util.async_db import Connection, Database, UpgradeTable
+from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 # ---------------------------------------------------------------------------
 # Event type registration
@@ -54,12 +56,27 @@ from maubot.handlers import event
 #
 # Note: this plugin only handles the stable namespace. If you also need to
 # mirror legacy `org.matrix.mjolnir.rule.*` events, register them the same
-# way and add them to the decorator stack on mirror_rule().
+# way and add them to the decorator stack on on_policy_rule().
 # ---------------------------------------------------------------------------
 
 POLICY_USER = EventType.find("m.policy.rule.user", t_class=EventType.Class.STATE)
 POLICY_ROOM = EventType.find("m.policy.rule.room", t_class=EventType.Class.STATE)
 POLICY_SERVER = EventType.find("m.policy.rule.server", t_class=EventType.Class.STATE)
+POLICY_TYPES = {POLICY_USER.t, POLICY_ROOM.t, POLICY_SERVER.t}
+
+
+upgrade_table = UpgradeTable()
+
+
+@upgrade_table.register(description="Sync token for outage catch-up")  # type: ignore[call-arg,arg-type]
+async def upgrade_v1(conn: Connection) -> None:
+    await conn.execute(
+        """CREATE TABLE sync_state (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            source_room TEXT NOT NULL,
+            next_batch  TEXT NOT NULL
+        )"""
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +97,26 @@ class Config(BaseProxyConfig):
 # ---------------------------------------------------------------------------
 
 class PolicyCopy(Plugin):
+    config: Config
+    database: Database
+    _prev_token: str | None
+    _prev_had_rules: bool
+    _catchup_pending: bool
+    _catchup_lock: asyncio.Lock
 
     @classmethod
-    def get_config_class(cls) -> Type[BaseProxyConfig]:
+    def get_config_class(cls) -> type[BaseProxyConfig]:
         return Config
+
+    @classmethod
+    def get_db_upgrade_table(cls) -> UpgradeTable:
+        return upgrade_table
+
+    async def pre_start(self) -> None:
+        self._prev_token = None
+        self._prev_had_rules = False
+        self._catchup_pending = True
+        self._catchup_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await super().start()
@@ -94,12 +127,102 @@ class PolicyCopy(Plugin):
             self.config["source_room"],
             self.config["destination_room"],
         )
+        await self.catch_up()
+
+    async def load_token(self) -> str | None:
+        row = await self.database.fetchrow(
+            "SELECT source_room, next_batch FROM sync_state WHERE id = 1"
+        )
+        if row is None or row["source_room"] != self.config["source_room"]:
+            return None
+        token: str = row["next_batch"]
+        return token
+
+    async def save_token(self, token: str) -> None:
+        await self.database.execute(
+            """INSERT INTO sync_state (id, source_room, next_batch) VALUES (1, $1, $2)
+               ON CONFLICT (id) DO UPDATE
+               SET source_room = excluded.source_room, next_batch = excluded.next_batch""",
+            self.config["source_room"], token,
+        )
+
+    def source_rule_events(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        room = data.get("rooms", {}).get("join", {}).get(self.config["source_room"], {})
+        raw = room.get("state", {}).get("events", []) + room.get("timeline", {}).get("events", [])
+        return [ev for ev in raw if ev.get("type") in POLICY_TYPES and "state_key" in ev]
+
+    async def replay(self, raws: list[dict[str, Any]], label: str) -> None:
+        source = self.config["source_room"]
+        for raw in raws:
+            try:
+                rule = StateEvent.deserialize(JSON({**raw, "room_id": source}))
+            except Exception:
+                self.log.exception("Could not parse %s event %s", label, raw.get("event_id"))
+                continue
+            await self.mirror_rule(rule)
+
+    async def catch_up(self) -> None:
+        async with self._catchup_lock:
+            source = self.config["source_room"]
+            since = await self.load_token()
+            if since is None:
+                self.log.info("No stored sync token for %s, skipping catch-up", source)
+                self._catchup_pending = False
+                return
+
+            sync_filter = {
+                "room": {
+                    "rooms": [source],
+                    "state": {"types": sorted(POLICY_TYPES)},
+                    "timeline": {"types": sorted(POLICY_TYPES), "limit": 100},
+                    "ephemeral": {"types": []},
+                    "account_data": {"types": []},
+                },
+                "presence": {"types": []},
+                "account_data": {"types": []},
+            }
+            try:
+                data = await self.client.sync(
+                    since=SyncToken(since), timeout=0, filter_id=FilterID(json.dumps(sync_filter))
+                )
+            except Exception:
+                self.log.exception("Catch-up sync failed, keeping old token until a retry works")
+                self._catchup_pending = True
+                return
+
+            latest: dict[tuple[str, str], dict[str, Any]] = {}
+            for ev in self.source_rule_events(data):
+                latest[(ev["type"], ev["state_key"])] = ev
+
+            await self.replay(list(latest.values()), "missed")
+            self.log.info("Catch-up done: %d missed rule(s) replayed", len(latest))
+            await self.save_token(data["next_batch"])
+            self._catchup_pending = False
+
+    @event.on(InternalEventType.SYNC_SUCCESSFUL)  # type: ignore[arg-type]
+    async def track_token(self, evt: dict[str, Any]) -> None:
+        data = evt["data"]
+        if self._catchup_pending:
+            if not self._catchup_lock.locked():
+                await self.catch_up()
+        elif self._prev_token and self._prev_had_rules:
+            await self.save_token(self._prev_token)
+
+        if data.get("net.maunium.mautrix", {}).get("is_first"):
+            await self.replay(self.source_rule_events(data), "first-sync")
+            self._prev_token, self._prev_had_rules = None, False
+            return
+        self._prev_token = data.get("next_batch")
+        self._prev_had_rules = bool(self.source_rule_events(data))
 
     # Stack one decorator per policy rule subtype. The handler body is the
     # same for all three, so we keep it in a single method.
-    @event.on(POLICY_USER)
-    @event.on(POLICY_ROOM)
-    @event.on(POLICY_SERVER)
+    @event.on(POLICY_USER)  # type: ignore[arg-type]
+    @event.on(POLICY_ROOM)  # type: ignore[arg-type]
+    @event.on(POLICY_SERVER)  # type: ignore[arg-type]
+    async def on_policy_rule(self, evt: StateEvent) -> None:
+        await self.mirror_rule(evt)
+
     async def mirror_rule(self, evt: StateEvent) -> None:
         source = self.config["source_room"]
         destination = self.config["destination_room"]
@@ -171,10 +294,11 @@ class PolicyCopy(Plugin):
             )
             return
 
+        content: Any = evt.content
         self.log.info(
             "Copied %s rule state_key=%s entity=%s -> %s",
             evt.type,
             evt.state_key,
-            (evt.content or {}).get("entity", "<empty/removed>"),
+            content.serialize().get("entity", "<empty/removed>"),
             destination,
         )
